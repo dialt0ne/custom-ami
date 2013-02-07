@@ -4,7 +4,7 @@
 
 This is the procedure I am using to create a CentOS 5 AMI on AWS. If you want
 a CentOS 6 install, the core developers have setup some AMIs in the
-[AWS MarketPlace(https://aws.amazon.com/marketplace/seller-profile?id=16cb8b03-256e-4dde-8f34-1b0f377efe89).
+[AWS MarketPlace](https://aws.amazon.com/marketplace/seller-profile?id=16cb8b03-256e-4dde-8f34-1b0f377efe89).
 However, I needed a CentOS 5 install and this was the cleanest way to produce an AMI
 without dragging along all the extras from AMI made by someone else.
 
