@@ -1,0 +1,303 @@
+#
+# create a CenOS EBS-backed AMI
+#
+# ATonns Thu Feb  7 17:25:03 EST 2013
+#
+#   Copyright 2013 Corsis
+#   http://www.corsis.com/
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+#
+
+CLIENT="fhqwhgads"
+REVISION="$CLIENT-x86_64-ebs-core-v1.1"
+TARGETAZ="us-east-1a"
+KEYNAME="root-$CLIENT"
+TESTSG="test-security-group"
+VOLUMESIZE="20"
+
+# use rightscale AMI to bootstrap
+AMI=ami-10008479
+
+# launch the instance
+ARGS=""
+ARGS="$ARGS --instance-type m1.small"
+ARGS="$ARGS --availability-zone $TARGETAZ"
+ARGS="$ARGS --group $TESTSG"
+ARGS="$ARGS --key $KEYNAME"
+CMD=($(ec2-run-instances $AMI $ARGS))
+BUILDER=${CMD[5]}
+ec2-create-tags $BUILDER --tag Name=builder-$REVISION
+
+# create and tag the volume
+CMD=($(ec2-create-volume --size $VOLUMESIZE --availability-zone $TARGETAZ --type standard))
+EBSVOL=${CMD[1]}
+ec2-create-tags $EBSVOL --tag Name=$REVISION
+
+# attach the volume
+ec2-attach-volume $EBSVOL --instance $BUILDER --device /dev/sdf
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
+
+# login to the rightscale instance as root
+
+# prep
+WORKING=`mktemp -d`
+CHDIR="/centos-install"
+
+# format and mount the EBS volume
+mkfs -t ext3 -F -m0 -j -L root /dev/sdf
+mkdir -p $CHDIR
+mount /dev/sdf $CHDIR
+
+# setup /dev
+mkdir $CHDIR/dev
+/sbin/MAKEDEV -d $CHDIR/dev -x console
+/sbin/MAKEDEV -d $CHDIR/dev -x null
+/sbin/MAKEDEV -d $CHDIR/dev -x zero
+/sbin/MAKEDEV -d $CHDIR/dev -x random
+/sbin/MAKEDEV -d $CHDIR/dev -x urandom
+
+# setup /proc
+mkdir $CHDIR/proc
+mount -t proc none $CHDIR/proc
+
+# setup /etc/hosts
+mkdir $CHDIR/etc
+echo "127.0.0.1 localhost localhost.localdomain" > $CHDIR/etc/hosts
+
+# setup /etc/fstab
+cat <<EOL > $CHDIR/etc/fstab
+LABEL=root /         ext3    defaults        1 1
+none       /dev/pts  devpts  gid=5,mode=620  0 0
+none       /dev/shm  tmpfs   defaults        0 0
+none       /proc     proc    defaults        0 0
+none       /sys      sysfs   defaults        0 0
+none       /tmp      tmpfs   size=512m,mode=1777 0 0
+EOL
+# other prep
+mkdir -p $CHDIR/www/
+mkdir -p $CHDIR/www/src/
+mkdir -p $CHDIR/sys/block
+mkdir -p $CHDIR/var/
+mkdir -p $CHDIR/var/log/
+
+# install OS
+cat << EOL > $WORKING/yum.conf
+[main]
+cachedir=/var/cache/yum
+keepcache=0
+debuglevel=2
+logfile=/var/log/yum.log
+distroverpkg=redhat-release
+tolerant=1
+exactarch=1
+obsoletes=1
+gpgcheck=1
+plugins=1
+bugtracker_url=http://bugs.centos.org/yum5bug
+metadata_expire=1h
+installonly_limit = 5
+[base]
+name=CentOS-5 - Base
+baseurl=http://mirror.centos.org/centos/5/os/x86_64/
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-5
+[updates]
+name=CentOS-5 - Updates
+baseurl=http://mirror.centos.org/centos/5/updates/x86_64/
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-5
+[extras]
+name=CentOS-5 - Extras
+baseurl=http://mirror.centos.org/centos/5/extras/x86_64/
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-5
+[centosplus]
+name=CentOS-5 - Plus
+baseurl=http://mirror.centos.org/centos/5/centosplus/x86_64/
+gpgcheck=1
+enabled=0
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-5
+[contrib]
+name=CentOS-5 - Contrib
+baseurl=http://mirror.centos.org/centos/5/contrib/x86_64/
+gpgcheck=1
+enabled=0
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-5
+EOL
+
+# install the core OS
+yum -c $WORKING/yum.conf --installroot=$CHDIR -y groupinstall core
+# install stuff I like
+yum -c $WORKING/yum.conf --installroot=$CHDIR -y install \
+    kernel-xen dhclient \
+    perl net-snmp ntp postfix lsof rcs cvs \
+    openssh openssh-clients openssh-server \
+    sysstat dstat yum-cron.noarch logrotate \
+    bind-utils bzip2 curl dos2unix ftp gnupg \
+    man man-pages.noarch patch rsync sudo tcpdump \
+    time traceroute unix2dos unzip wget which zip \
+    iptables jwhois ksh lftp logwatch.noarch mailx 
+# uninstall stuff I don't like
+yum -c $WORKING/yum.conf --installroot=$CHDIR -y remove \
+    sendmail gpm yum-updatesd.noarch
+# tidy up
+yum -c $WORKING/yum.conf --installroot=$CHDIR -y clean packages
+
+# more system prep
+cat <<EOL > $CHDIR/etc/sysconfig/network
+NETWORKING=yes
+HOSTNAME=localhost.localdomain
+EOL
+
+# dhcp and addr
+cat <<EOL > $CHDIR/etc/sysconfig/network-scripts/ifcfg-eth0
+ONBOOT=yes
+DEVICE=eth0
+BOOTPROTO=dhcp
+EOL
+
+# prep xen drivers
+cat > $CHDIR/etc/modprobe.d/xen-drivers << EOL
+alias eth0 xennet
+alias eth1 xennet
+alias scsi_hostadapter xenblk
+EOL
+
+# make sure ssh does't hang on dns and
+# allow root login only w/key
+test -f $CHDIR/etc/ssh/sshd_config.orig || cp -p $CHDIR/etc/ssh/sshd_config $CHDIR/etc/ssh/sshd_config.orig
+cat <<EOL >> $CHDIR/etc/ssh/sshd_config
+UseDNS  no
+PermitRootLogin without-password
+EOL
+
+# add sbin to path
+cat > $CHDIR/etc/profile.d/sbin.sh << \EOL
+pathmunge () {
+  if ! echo $PATH | /bin/egrep -q "(^|:)$1($|:)" ; then
+    if [ "$2" = "after" ] ; then
+      PATH=$PATH:$1
+    else
+      PATH=$1:$PATH
+    fi
+  fi
+}
+pathmunge /sbin
+pathmunge /usr/sbin
+pathmunge /usr/local/sbin
+export PATH
+unset pathmunge
+EOL
+chown root:root $CHDIR/etc/profile.d/sbin.sh
+chmod 644 $CHDIR/etc/profile.d/sbin.sh
+
+# duplicate rightscale init script to get root key upon boot
+cp -p /etc/init.d/getsshkey $CHDIR/etc/rc.d/init.d/getsshkey
+
+# ship all mail home
+echo 'root@example.com' > $CHDIR/root/.forward
+chmod 600 $CHDIR/root/.forward
+
+# prep custom tweaks
+cat << \EOL > $CHDIR/root/custom-tweaks.sh
+# tweak ttys
+perl -p -i -e 's/(.*tty2)/#\1/' /etc/inittab
+perl -p -i -e 's/(.*tty3)/#\1/' /etc/inittab
+perl -p -i -e 's/(.*tty4)/#\1/' /etc/inittab
+perl -p -i -e 's/(.*tty5)/#\1/' /etc/inittab
+perl -p -i -e 's/(.*tty6)/#\1/' /etc/inittab
+# tweak ssh keepalives
+perl -p -i -e 's/#ClientAliveInterval 0/ClientAliveInterval 60/' /etc/ssh/sshd_config
+perl -p -i -e 's/#ClientAliveCountMax 3/ClientAliveCountMax 240/' /etc/ssh/sshd_config
+# turn off selinux
+perl -p -i -e 's/SELINUX=enforcing/SELINUX=disabled/' /etc/selinux/config
+# setup shadowing
+authconfig --enableshadow --useshadow --enablemd5 --updateall
+# enable/disable services
+chkconfig getsshkey on
+chkconfig yum-cron on
+chkconfig snmpd on
+chkconfig ntpd on
+# disable services
+chkconfig nfslock off
+chkconfig portmap off
+chkconfig autofs off
+chkconfig kudzu off
+chkconfig --del kudzu
+chkconfig rdisc off
+chkconfig --del rdisc
+EOL
+chmod 700 $CHDIR/root/custom-tweaks.sh
+
+# run custom tweaks
+chroot $CHDIR /root/custom-tweaks.sh
+
+# stub grub config
+cat << EOL > $CHDIR/boot/grub/grub.conf
+default=0
+timeout=0
+hiddenmenu
+ 
+EOL
+ln -s grub.conf $CHDIR/boot/grub/menu.lst
+ 
+# configure grub and get the initrd straight
+cat << \EOL > $CHDIR/root/boot-setup.sh
+for VER in `rpm -q kernel-xen --queryformat %{VERSION}-%{RELEASE}`; do
+    KERNELVER=${VER}xen;
+    INITRD=/boot/initrd-${KERNELVER}-ec2.img;
+    echo $KERNELVER;
+    echo $INITRD;
+    echo "Running mkinitrd ${INITRD} ${KERNELVER} --preload=xenblk --with=xennet";
+    /sbin/mkinitrd ${INITRD} ${KERNELVER} -f --preload=xenblk --with=xennet;
+    echo "title CentOS (${KERNELVER})" >> /boot/grub/grub.conf;
+    echo "  root (hd0)" >> /boot/grub/grub.conf;
+    echo "  kernel /boot/vmlinuz-${KERNELVER} root=LABEL=root ro consoleblank=0 console=hvc0" >> /boot/grub/grub.conf;
+    echo "  initrd $INITRD" >> /boot/grub/grub.conf;
+    echo >> /boot/grub/grub.conf;
+done
+EOL
+chmod 700 $CHDIR/root/boot-setup.sh
+
+# setup the boot config
+chroot $CHDIR /root/boot-setup.sh
+
+# dismount filesystem
+cd
+sync
+umount $CHDIR/proc
+umount -d $CHDIR 
+
+# clean up
+rm -rf $WORKING
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
+
+# detach the volume
+ec2-detach-volume $EBSVOL --instance $BUILDER --device /dev/sdf
+
+# create a snapshot
+CMD=($(ec2-create-snapshot --description $REVISION $EBSVOL))
+SNAPID=${CMD[1]}
+# tag it
+ec2-create-tags $SNAPID --tag Name=$REVISION
+
+# choose the right kernel id
+# http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/UserProvidedkernels.html#pv-grub-a-new-amazon-kernel-image
+AKIID="aki-88aa75e1"
+# create AMI
+ec2-register --name $REVISION --description $REVISION --architecture x86_64 \
+    --root-device-name /dev/sda1 --block-device-mapping /dev/sda1=$SNAPID --kernel $AKIID
+
