@@ -1,5 +1,5 @@
 #
-# create a CenOS EBS-backed AMI
+# create a CentOS EBS-backed AMI
 #
 # ATonns Thu Feb  7 17:25:03 EST 2013
 #
