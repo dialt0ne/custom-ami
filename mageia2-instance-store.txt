@@ -1,0 +1,151 @@
+#
+# mageia2-instance-store
+#
+#   Copyright 2013 Corsis
+#   http://www.corsis.com/
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+#
+
+# preparation
+export PATH=$PATH:/sbin:/usr/sbin
+# create a working directory
+mkdir $HOME/ec2
+# create ssh public key
+ssh-keygen -t rsa -f $HOME/ec2/mageia -C "mageia@ec2" -P ""
+# setup the image
+dd if=/dev/zero of=mageia2-instance-store-v1.img bs=1M count=8192
+# format it
+mke2fs -F -j $HOME/ec2/mageia2-instance-store-v1.img
+
+# everything forward needs to be done as root 
+sudo bash -o vi
+
+# mount the image for chroot
+export MAGEIA_PUB_KEY=$HOME/ec2/mageia.pub
+export CHRDIR=$HOME/ec2/loop
+# mount the chroot location
+mount -o loop $HOME/ec2/mageia2-instance-store-v1.img $CHRDIR
+
+# create the minimum devices
+mkdir $CHRDIR/dev
+/sbin/makedev $CHRDIR/dev console
+/sbin/makedev $CHRDIR/dev null
+/sbin/makedev $CHRDIR/dev zero
+
+# setup the minimum filesystems
+mkdir $CHRDIR/etc
+cat > $CHRDIR/etc/fstab << EOF
+/dev/xvda1 /         ext3    defaults        1 1
+none       /dev/pts  devpts  gid=5,mode=620  0 0
+none       /dev/shm  tmpfs   defaults        0 0
+none       /proc     proc    defaults        0 0
+none       /sys      sysfs   defaults        0 0
+EOF
+
+# add required /proc filesystem
+mkdir $CHRDIR/proc
+mount -t proc none $CHRDIR/proc
+
+# choose the best/fastest mirror
+GET http://mirrors.mageia.org/api/mageia.2.x86_64.list | grep country=US
+# setup the urpmi media locations in the chroot
+urpmi.addmedia --distrib --urpmi-root $CHRDIR http://mirrors.kernel.org/mageia/distrib/2/x86_64
+# install the minimum packages
+urpmi --auto --urpmi-root $CHRDIR kernel-server basesystem urpmi locales-en sshd sudo dhcp-client
+
+# MASSIVE HACK TIME
+#
+# kernel from tmb:
+# http://tmb.mine.nu/Mageia/2/ec2/
+#
+mkdir tmb
+pushd tmb
+curl -O http://tmb.mine.nu.nyud.net/Mageia/2/ec2/kernel-server-3.4.18-1.mga2-1-1.mga2.x86_64.rpm
+curl -O http://tmb.mine.nu.nyud.net/Mageia/2/ec2/kmod-7-7.mga2.x86_64.rpm
+popd
+# install custom kernel
+rpm --root=$CHRDIR -Uhv tmb/*.rpm
+
+# insure the new ramdisk is created properly
+chroot $CHRDIR
+cd /boot
+mkinitrd initrd-3.4.18-server-1.mga2.img.a 3.4.18-server-1.mga2
+exit
+
+# set the kernel to load on boot
+cat > $CHRDIR/boot/grub/menu.lst << EOF
+default=0
+timeout=0
+title linux
+  root (hd0)
+  kernel /boot/vmlinuz-server ro root=/dev/xvda1 console=hvc0 BOOT_IMAGE=linux-nonfb
+  initrd /boot/initrd-server.img
+EOF
+
+# configure the chroot network for ec2
+cat > $CHRDIR/etc/sysconfig/network-scripts/ifcfg-eth0 << EOF
+DEVICE=eth0
+BOOTPROTO=dhcp
+ONBOOT=yes
+TYPE=Ethernet
+USERCTL=yes
+PEERDNS=yes
+IPV6INIT=no
+EOF
+cat > $CHRDIR/etc/sysconfig/network << EOF
+NETWORKING=yes
+CRDA_DOMAIN=US
+EOF
+
+# configure ssh
+test -f $CHRDIR/etc/ssh/sshd_config.orig || cp -p $CHRDIR/etc/ssh/sshd_config $CHRDIR/etc/ssh/sshd_config.orig
+cat $CHRDIR/etc/ssh/sshd_config.orig |
+    sed -e 's/^#UseDNS yes/UseDNS no/g' |
+    sed -e 's/^PermitRootLogin no/PermitRootLogin without-password/g' > $CHRDIR/etc/ssh/sshd_config
+# setup mageia account
+chroot $CHRDIR /usr/sbin/useradd --create-home --home /home/mageia --shell /bin/bash mageia
+mkdir --mode=0700 $CHRDIR/home/mageia/.ssh
+(umask 0077; touch $CHRDIR/home/mageia/.ssh/authorized_keys)
+cat $MAGEIA_PUB_KEY >> $CHRDIR/home/mageia/.ssh/authorized_keys
+echo "set -o vi" >> $CHRDIR/home/mageia/.bashrc
+chown -Rh 500:500 $CHRDIR/home/mageia/.ssh
+(umask 0227; echo "mageia ALL=(ALL) NOPASSWD:ALL" > $CHRDIR/etc/sudoers.d/mageia)
+
+# dismount the chroot
+umount $CHRDIR/proc
+umount -d $CHRDIR
+
+# setup for EC2
+export EC2_ID=[aws account id #]
+export EC2_PRIVATE_KEY=[location of private key]
+export EC2_CERT=[location of signing cert]
+export EC2_ACCESS=[iam access key]
+export EC2_SECRET=[iam secret key]
+
+BUCKETNAME="$EC2_ID-mageia2-instance-store-v1"
+# create S3 bucket
+# you can use the AWS Console instead of s3cmd, if you like
+s3cmd mb s3://$BUCKETNAME
+# where to put the bundle parts
+pushd $HOME/ec2
+mkdir mageia2-instance-store-v1
+# create the AMI bundle
+# AKI for pv-grub-hd0_1.03-x86_64.gz partitionless PV-GRUB in US-East-1
+AKIID="aki-88aa75e1"
+ec2-bundle-image -i mageia2-instance-store-v1.img -d mageia2-instance-store-v1 -r x86_64 --kernel $AKIID -k $EC2_PRIVATE_KEY -c $EC2_CERT -u $EC2_ID
+# put it on S3
+ec2-upload-bundle -b $BUCKETNAME -m mageia2-instance-store-v1/mageia2-instance-store-v1.img.manifest.xml -a $EC2_ACCESS -s $EC2_SECRET
+# register it
+ec2-register $BUCKETNAME/mageia2-instance-store-v1.img.manifest.xml -n mageia2-instance-store-v1
+popd

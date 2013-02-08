@@ -1,0 +1,154 @@
+#
+# mageia2 ebs
+#
+#   Copyright 2013 Corsis
+#   http://www.corsis.com/
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+#
+
+# from workstation with api/ami tools
+SIZE=32
+TARGETAZ=us-east-1a
+INSTID=i-09abcdef
+
+CMD=($(ec2-create-volume --size $SIZE --availability-zone $TARGETAZ --type standard))
+VOLID=${CMD[1]}
+ec2-attach-volume $VOLID --instance $INSTID --device /dev/sdg
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
+
+# from an instance running on EC2
+mkdir $HOME/ec2
+
+# everything forward needs to be done as root 
+sudo bash -o vi
+cd $HOME/ec2
+export PATH=$PATH:/sbin:/usr/sbin
+
+# setup the filesystem
+/sbin/mkfs -t ext4 /dev/xvdg
+
+# mount the image for chroot
+export CHRDIR=$HOME/ec2/loop
+mount /dev/xvdg $CHRDIR
+
+# create the minimum devices
+mkdir $CHRDIR/dev
+/sbin/makedev $CHRDIR/dev console
+/sbin/makedev $CHRDIR/dev null
+/sbin/makedev $CHRDIR/dev zero
+
+# setup the minimum filesystems
+mkdir $CHRDIR/etc
+cat > $CHRDIR/etc/fstab << EOF
+/dev/xvda1 /         ext3    defaults        1 1
+none       /dev/pts  devpts  gid=5,mode=620  0 0
+none       /dev/shm  tmpfs   defaults        0 0
+none       /proc     proc    defaults        0 0
+none       /sys      sysfs   defaults        0 0
+EOF
+
+# add required /proc filesystem
+mkdir $CHRDIR/proc
+mount -t proc none $CHRDIR/proc
+
+# choose the best/fastest mirror
+GET http://mirrors.mageia.org/api/mageia.2.x86_64.list | grep country=US
+# setup the urpmi media locations in the chroot
+urpmi.addmedia --distrib --urpmi-root $CHRDIR http://mirrors.kernel.org/mageia/distrib/2/x86_64
+# install the minimum packages
+urpmi --auto --urpmi-root $CHRDIR basesystem urpmi locales-en sshd sudo dhcp-client
+
+# MASSIVE HACK TIME
+rpm --root=$CHRDIR -Uhv custom-kernel/kernel-server-3.3.8-2.mga2-1-1.mga2.x86_64.rpm
+
+# cleanup desktop kernel
+chroot $CHRDIR
+urpme kernel-desktop-3.3.8-2.mga2-1-1.mga2
+rm -f initrd-desktop.img  vmlinuz-desktop 
+# confirm there's a good initrd
+cd /boot
+stat initrd-3.3.8-server-2.mga2.img
+mkinitrd initrd-3.3.8-server-2.mga2.img 3.3.8-server-2.mga2
+exit
+
+# set the kernel to load on boot
+cat > $CHRDIR/boot/grub/menu.lst << EOF
+default=0
+timeout=0
+title linux
+  root (hd0)
+  kernel /boot/vmlinuz-server ro root=/dev/xvda1 console=hvc0 BOOT_IMAGE=linux-nonfb
+  initrd /boot/initrd-server.img
+EOF
+
+# do not upgrade the kernel, until upstream fixes the xz/gz issue
+test -f $CHRDIR/etc/urpmi/skip.list || cp -p $CHRDIR/etc/urpmi/skip.list $CHRDIR/etc/urpmi/skip.list.orig
+cat > $CHRDIR/etc/urpmi/skip.list << EOF
+# Here you can specify the packages that won't be upgraded automatically
+# for example, to exclude all apache packages :
+# /^apache/
+/^kernel/
+EOF
+
+# configure the chroot network for ec2
+cat > $CHRDIR/etc/sysconfig/network-scripts/ifcfg-eth0 << EOF
+DEVICE=eth0
+BOOTPROTO=dhcp
+ONBOOT=yes
+TYPE=Ethernet
+USERCTL=yes
+PEERDNS=yes
+IPV6INIT=no
+EOF
+cat > $CHRDIR/etc/sysconfig/network << EOF
+NETWORKING=yes
+CRDA_DOMAIN=US
+EOF
+
+# configure ssh
+test -f $CHRDIR/etc/ssh/sshd_config.orig || cp -p $CHRDIR/etc/ssh/sshd_config $CHRDIR/etc/ssh/sshd_config.orig
+cat $CHRDIR/etc/ssh/sshd_config.orig |
+    sed -e 's/^#UseDNS yes/UseDNS no/g' |
+    sed -e 's/^PermitRootLogin no/PermitRootLogin without-password/g' > $CHRDIR/etc/ssh/sshd_config
+# create login account
+chroot $CHRDIR /usr/sbin/useradd --create-home --home /home/mageia --shell /bin/bash mageia
+(umask 0227; echo "mageia ALL=(ALL) NOPASSWD:ALL" > $CHRDIR/etc/sudoers.d/mageia)
+
+# setup ssh public key
+cp ec2-get-ssh $CHRDIR/etc/rc.d/init.d/ec2-get-ssh
+chmod 0750 $CHRDIR/etc/rc.d/init.d/ec2-get-ssh
+chown root:root $CHRDIR/etc/rc.d/init.d/ec2-get-ssh
+chroot $CHRDIR /sbin/chkconfig ec2-get-ssh on
+
+# dismount the chroot
+umount $CHRDIR/proc
+umount -d $CHRDIR
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
+
+# from workstation with api/ami tools
+
+# detach the volume
+ec2-detach-volume $VOLID --instance $INSTIT--device /dev/sdg
+
+# create a snapshot
+CMD=($(ec2-create-snapshot --description "Mageia 2" $EBSVOL))
+SNAPID=${CMD[1]}
+
+# create AMI
+AKIID="aki-88aa75e1"
+ec2-register --name "Mageia 2" --description "Mageia 2" \
+    --architecture x86_64 --root-device-name /dev/sda1 \
+    --block-device-mapping /dev/sda1=$SNAPID --kernel $AKIID

@@ -1,0 +1,102 @@
+#
+# mageia2-custom-kernel
+#
+#   Copyright 2013 Corsis
+#   http://www.corsis.com/
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+#
+
+#
+# prep stuff done as root
+#
+sudo bash -o vi
+# mount the ephemeral storage
+mkfs -t ext4 /dev/xvdb
+mkdir /media/extra
+mount /dev/xvdb /media/extra
+# create some swap
+dd if=/dev/zero of=/media/extra/swapfile00 bs=1024 count=4194304
+mkswap /media/extra/swapfile00
+swapon /media/extra/swapfile00
+# setup space for kernel building
+mkdir /media/extra/kernel
+chown $USER:$USER /media/extra/kernel
+exit
+
+#
+# build stuff done as normal user
+#
+# prep for kernel building
+cd $HOME
+ln -s /media/extra/kernel
+cd kernel/
+# bring down the source
+curl -O http://mirrors.kernel.org/mageia/distrib/2/SRPMS/core/updates/kernel-3.3.8-2.mga2.src.rpm
+mkdir SOURCES
+cd SOURCES
+# extract the source
+rpm2cpio ../kernel-3.3.8-2.mga2.src.rpm | cpio -i
+# make a working copy of the .spec file
+cp -p kernel.spec ..
+# extract the mageia customizations
+tar Jxf linux-3.3.8-mga2.tar.xz
+cd 3.3.8-mga2/configs/
+# modify the kernel config for gzip compression
+cp -p x86_64.config x86_64.config.orig
+vi x86_64.config
+# diff of what it looks like when it's done
+$ diff -u x86_64.config.orig x86_64.config
+--- x86_64.config.orig  2012-07-12 08:53:47.000000000 +0000
++++ x86_64.config       2012-11-15 04:48:37.000000000 +0000
+@@ -67,10 +67,10 @@
+ CONFIG_HAVE_KERNEL_LZMA=y
+ CONFIG_HAVE_KERNEL_XZ=y
+ CONFIG_HAVE_KERNEL_LZO=y
+-# CONFIG_KERNEL_GZIP is not set
++CONFIG_KERNEL_GZIP=y
+ # CONFIG_KERNEL_BZIP2 is not set
+ # CONFIG_KERNEL_LZMA is not set
+-CONFIG_KERNEL_XZ=y
++# CONFIG_KERNEL_XZ is not set
+ # CONFIG_KERNEL_LZO is not set
+ CONFIG_DEFAULT_HOSTNAME="(none)"
+ CONFIG_SWAP=y
+
+# rebuild the mageia customizations
+cd ../..
+mv linux-3.3.8-mga2.tar.xz linux-3.3.8-mga2.tar.xz.orig
+tar Jcf linux-3.3.8-mga2.tar.xz 3.3.8-mga2
+
+# install builder dependencies
+sudo urpmi easyrpmbuilder
+sudo urpmi elfutils-devel zlib-devel binutils-devel newt-devel python-devel pciutils-devel asciidoc xmlto docbook-style-xsl
+
+# setup the build script
+cat do-build.sh
+#!/bin/sh -x
+rm -rf BUILD BUILDROOT RPMS SRPMS tmp || true
+mkdir -p BUILD BUILDROOT RPMS SRPMS tmp
+
+OPTS=""
+OPTS="$OPTS --with=server"
+OPTS="$OPTS --without=desktop"
+OPTS="$OPTS --without=desktop586"
+OPTS="$OPTS --without=netbook"
+rpmbuild $OPTS -bb --define="_topdir $PWD" --define="_tmppath $PWD/tmp" kernel.spec 2>&1 | tee kernel-build.txt
+
+# do the build
+time ./do-build.sh
+
+# save the rpm
+scp -p RPMS/x86_64/kernel-server-3.3.8-2.mga2-1-1.mga2.x86_64.rpm $REMOTE_SERVER:

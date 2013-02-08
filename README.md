@@ -1,12 +1,20 @@
 ## Custom Setups of AWS AMIs
 
-### CentOS 5 on AWS - centos-ami-setup.txt
+### CentOS 5
 
 This is the procedure I am using to create a CentOS 5 AMI on AWS. If you want
 a CentOS 6 AMI, the core developers have setup some in the
 [AWS MarketPlace](https://aws.amazon.com/marketplace/seller-profile?id=16cb8b03-256e-4dde-8f34-1b0f377efe89).
-However, I needed a CentOS 5 install for a client and this was the cleanest way to produce an AMI
-without dragging along all the extras from one of the community-provided AMI.
+However, I needed a CentOS 5 install for a client and this was the cleanest
+way to produce an AMI without dragging along all the extras from one of the
+community-provided AMI.
+
+### Mageia2
+
+These 3 docs are duplicates of the posts I wrote up on
+[my blog](http://blog.tonns.org/2012/11/mageia2-on-ec2-flying-in-different.html).
+They are not as clean as the CentOS setup, but have workable directions on
+how to get the instance store AMI, kernel compile and EBS AMI setup.
 
 ### License
 
