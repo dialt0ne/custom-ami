@@ -1,0 +1,225 @@
+#
+# create a CentOS 6 EBS-backed HVM AMI
+#
+# ATonns Wed Sep 24 09:09:35 EDT 2014
+#
+
+CLIENT="fhqwhgads"
+REGION="eu-west-1"
+TARGETAZ="eu-west-1a"
+VOLUMESIZE="16" # in GB
+VOLUMETYPE="gp2"
+
+REVISION="$CLIENT-centos6-hvm-ami-v1.3"
+
+# create and tag the volume
+VOLINFO=`mktemp volinfo.XXXXXXXX`
+aws ec2 create-volume \
+    --region $REGION \
+    --availability-zone $TARGETAZ \
+    --size $VOLUMESIZE \
+    --volume-type $VOLUMETYPE \
+    | tee $VOLINFO
+VOLID=`cat $VOLINFO | jq -r '.VolumeId'`
+aws ec2 create-tags --region $REGION --resources $VOLID --tags Key=Name,Value=$REVISION
+rm -f $VOLINFO
+
+# Used CentOS-6.5-GA-03.3 (ami-42718735) as the builder instance
+# attach the volume to the builder instance
+BUILDERIID="i-09abcdef"
+aws ec2 attach-volume --region $REGION --volume-id $VOLID --instance-id $BUILDERIID --device /dev/sdf
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
+
+# login to the rightscale instance as root
+
+# prep
+WORKING=`mktemp -d working.XXXXXXXX`
+CHDIR="/centos-install"
+yum -y install MAKEDEV parted 
+
+RAWDEV="/dev/xvdj"
+
+# format and mount the EBS volume
+parted ${RAWDEV} mklabel msdos mkpart primary ext4 1M 100% set 1 boot on print
+mkfs -t ext4 -F -L root ${RAWDEV}1
+mkdir -p $CHDIR
+mount ${RAWDEV}1 $CHDIR
+
+# need MAKEDEV first
+/sbin/MAKEDEV -d $CHDIR/dev -D $CHDIR/dev -x console null zero random urandom
+#
+# NOTE a single "MAKEDEV: mkdir: File exists" is expected because $CHDIR exists
+
+# setup /proc
+mkdir $CHDIR/proc
+mount -t proc none $CHDIR/proc
+
+# other prep
+mkdir -p $CHDIR/etc
+mkdir -p $CHDIR/sys/block
+mkdir -p $CHDIR/var/
+mkdir -p $CHDIR/var/log/
+
+# setup /etc/fstab
+cat <<EOL > $CHDIR/etc/fstab
+LABEL=root /         ext4    defaults        1 1
+devpts     /dev/pts  devpts  gid=5,mode=620  0 0
+tmpfs      /dev/shm  tmpfs   defaults        0 0
+proc       /proc     proc    defaults        0 0
+sysfs      /sys      sysfs   defaults        0 0
+EOL
+
+# prep for install of OS
+cat /etc/yum.conf /etc/yum.repos.d/CentOS-Base.repo |sed s/'$releasever'/6/g > $WORKING/yum.conf
+
+# install the core OS
+yum --config=$WORKING/yum.conf --installroot=$CHDIR --nogpgcheck -y groupinstall core
+# install stuff I like
+yum --config=$WORKING/yum.conf --installroot=$CHDIR --nogpgcheck -y install \
+    kernel grub dhclient \
+    openssh openssh-clients openssh-server \
+    sudo perl ntp postfix lsof git \
+    sysstat dstat logrotate \
+    bind-utils bzip2 curl dos2unix ftp gnupg \
+    man man-pages.noarch patch rsync tcpdump \
+    time traceroute unix2dos zip unzip wget which \
+    iptables jwhois ksh lftp mailx
+# tidy up
+yum --config=$WORKING/yum.conf --installroot=$CHDIR -y clean packages
+
+# more system prep
+cat <<EOL > $CHDIR/etc/sysconfig/network
+NETWORKING=yes
+HOSTNAME=localhost.localdomain
+EOL
+
+# dhcp an addr
+cat <<EOL > $CHDIR/etc/sysconfig/network-scripts/ifcfg-eth0
+DEVICE=eth0
+BOOTPROTO=dhcp
+ONBOOT=on
+EOL
+
+# turn off selinux
+sed -i -e 's/SELINUX=enforcing/SELINUX=disabled/' $CHDIR/etc/selinux/config
+
+# tweak ssh:
+# - make sure ssh does't hang on dns and
+# - allow root login only w/ssh key
+# - set longer ssh keepalives
+test -f $CHDIR/etc/ssh/sshd_config.orig || cp -p $CHDIR/etc/ssh/sshd_config $CHDIR/etc/ssh/sshd_config.orig
+sed -i -e 's/#UseDNS yes/UseDNS no/' $CHDIR/etc/ssh/sshd_config
+sed -i -e 's/#PermitRootLogin yes/PermitRootLogin without-password/' $CHDIR/etc/ssh/sshd_config
+sed -i -e 's/#ClientAliveInterval 0/ClientAliveInterval 60/' $CHDIR/etc/ssh/sshd_config
+sed -i -e 's/#ClientAliveCountMax 3/ClientAliveCountMax 240/' $CHDIR/etc/ssh/sshd_config
+
+# add sbin to path
+cat > $CHDIR/etc/profile.d/sbin.sh << \EOL
+pathmunge () {
+  if ! echo $PATH | /bin/egrep -q "(^|:)$1($|:)" ; then
+    if [ "$2" = "after" ] ; then
+      PATH=$PATH:$1
+    else
+      PATH=$1:$PATH
+    fi
+  fi
+}
+pathmunge /sbin
+pathmunge /usr/sbin
+pathmunge /usr/local/sbin
+export PATH
+unset pathmunge
+EOL
+chown root:root $CHDIR/etc/profile.d/sbin.sh
+chmod 644 $CHDIR/etc/profile.d/sbin.sh
+
+# init script to get root key upon boot
+curl -L -s -o $CHDIR/etc/rc.d/init.d/get-ssh-key http://j.mp/1pd1jG0
+chown root:root $CHDIR/etc/rc.d/init.d/get-ssh-key
+chmod 754 $CHDIR/etc/rc.d/init.d/get-ssh-key
+chroot $CHDIR chkconfig get-ssh-key on
+
+# enable ntpd
+chroot $CHDIR chkconfig ntpd on
+
+# stub grub config
+cat << EOL > $CHDIR/boot/grub/grub.conf
+default=0
+timeout=1
+hiddenmenu
+ 
+EOL
+ln -s grub.conf $CHDIR/boot/grub/menu.lst
+ 
+# configure grub and get the initrd straight
+for KERNELVER in `rpm --root $CHDIR --query --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}' kernel`; do
+    INITRAMFS="/boot/initramfs-${KERNELVER}.img"
+    VMLINUZ="/boot/vmlinuz-${KERNELVER}"
+    echo "Running: dracut --force --add-drivers \"ixgbevf virtio\" ${INITRAMFS} ${KERNELVER}";
+    chroot $CHDIR dracut --force --add-drivers "ixgbevf virtio" ${INITRAMFS} ${KERNELVER}
+    echo "Adding to ${VMLINUZ} to grub.conf"
+    (
+    echo "title CentOS6 ${KERNELVER}";
+    echo "  root (hd0,0)";
+    echo "  kernel ${VMLINUZ} ro root=LABEL=root console=ttyS0 xen_blkfront.sda_is_xvda=1 verbose";
+    echo "  initrd ${INITRAMFS}";
+    echo "" ) >> $CHDIR/boot/grub/grub.conf;
+done
+
+# configure grub
+grub-install --root-directory=/centos-install hd1
+setarch x86_64 \
+    chroot $CHDIR \
+    env -i \
+    echo -e "device (hd0) ${RAWDEV}\nroot (hd0,0)\nsetup (hd0)" \
+        | grub --device-map=/dev/null --batch
+cat > $CHDIR/boot/grub/device.map << EOL
+(hd0) /dev/sda1
+EOL
+
+# dismount filesystem
+cd
+sync
+umount $CHDIR/proc
+umount -d $CHDIR 
+
+# clean up
+rm -rf $WORKING
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
+
+# detach the volume
+aws ec2 detach-volume --region $REGION --volume-id $VOLID --instance-id $BUILDERIID --device /dev/sdf
+
+# create a snapshot
+SNAPINFO=`mktemp snapinfo.XXXXXXXX`
+aws ec2 create-snapshot --region $REGION --volume-id $VOLID --description $REVISION | tee $SNAPINFO
+SNAPID=`cat $SNAPINFO | jq -r '.SnapshotId'`
+# tag it
+aws ec2 create-tags --region $REGION --resources $SNAPID --tags Key=Name,Value=$REVISION
+rm -f $SNAPINFO
+
+# block device mapping for ami
+BDM="["
+BDM="${BDM}{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"SnapshotId\":\"$SNAPID\"}},"
+BDM="${BDM}{\"DeviceName\":\"sdb\",\"VirtualName\":\"ephemeral0\"},"
+BDM="${BDM}{\"DeviceName\":\"sdc\",\"VirtualName\":\"ephemeral1\"},"
+BDM="${BDM}{\"DeviceName\":\"sdd\",\"VirtualName\":\"ephemeral2\"},"
+BDM="${BDM}{\"DeviceName\":\"sde\",\"VirtualName\":\"ephemeral3\"}"
+BDM="${BDM}]"
+# create AMI
+AMIINFO=`mktemp amiinfo.XXXXXXXX`
+aws ec2 register-image \
+    --region $REGION \
+    --name $REVISION \
+    --description $REVISION \
+    --architecture x86_64 \
+    --root-device-name /dev/sda1 \
+    --block-device-mapping "$BDM" \
+    --virtualization-type hvm | tee $AMIINFO
+AMIID=`cat $AMIINFO | jq -r '.ImageId'`
+# tag it
+aws ec2 create-tags --resources $AMIID --tags Key=Name,Value=$REVISION
+rm -f $AMIINFO
+
