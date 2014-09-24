@@ -1,5 +1,13 @@
 ## Custom Setups of AWS AMIs
 
+### CentOS 6 HVM
+
+This is the procedure I am using to create a CentOS 6 HVM AMI on AWS.
+To bootstrap it, I used the CentOS 6 AMI the core developers have setup some in the
+[AWS MarketPlace](https://aws.amazon.com/marketplace/seller-profile?id=16cb8b03-256e-4dde-8f34-1b0f377efe89).
+This does not have the enhanced networking drivers configured as it is not
+part of mainline CentOS6.
+
 ### CentOS 5
 
 This is the procedure I am using to create a CentOS 5 AMI on AWS. If you want
