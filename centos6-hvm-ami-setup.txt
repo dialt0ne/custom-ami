@@ -31,7 +31,7 @@ aws ec2 attach-volume --region $REGION --volume-id $VOLID --instance-id $BUILDER
 
 #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
 
-# login to the rightscale instance as root
+# login to the builder instance as root
 
 # prep
 WORKING=`mktemp -d working.XXXXXXXX`
@@ -220,6 +220,6 @@ aws ec2 register-image \
     --virtualization-type hvm | tee $AMIINFO
 AMIID=`cat $AMIINFO | jq -r '.ImageId'`
 # tag it
-aws ec2 create-tags --resources $AMIID --tags Key=Name,Value=$REVISION
+aws ec2 create-tags --region $REGION --resources $AMIID --tags Key=Name,Value=$REVISION
 rm -f $AMIINFO
 
